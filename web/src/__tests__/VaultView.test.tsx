@@ -562,3 +562,19 @@ describe("VaultView project loading recovery", () => {
     expect(api.fetchProjects).toHaveBeenCalledTimes(2);
   });
 });
+
+
+describe("VaultView independent initial loads", () => {
+  it("loads personal projects when organisation discovery fails", async () => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchOrgs).mockRejectedValue(new Error("offline"));
+    vi.mocked(api.fetchProjects).mockResolvedValue([project("personal-a")]);
+    vi.mocked(vault.decryptProjectName).mockImplementation((_key, id) => id);
+
+    renderVault();
+
+    expect(await screen.findByRole("button", { name: /personal-a/ })).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("organisations unavailable: offline");
+    expect(api.fetchProjects).toHaveBeenCalledOnce();
+  });
+});
