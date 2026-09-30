@@ -578,3 +578,28 @@ describe("VaultView independent initial loads", () => {
     expect(api.fetchProjects).toHaveBeenCalledOnce();
   });
 });
+
+
+describe("VaultView navigation ordering", () => {
+  it("sorts projects and environments by decrypted display name", async () => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([]);
+    vi.mocked(api.fetchProjects).mockResolvedValue([project("project-b"), project("project-a")]);
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-b"), environment("env-a")]);
+    vi.mocked(vault.decryptProjectName).mockImplementation((_key, id) => id);
+    vi.mocked(vault.decryptEnvName).mockImplementation((_key, id) => id);
+
+    renderVault();
+
+    const projects = screen.getByRole("heading", { name: "Projects" }).parentElement!;
+    await screen.findByRole("button", { name: /project-a/ });
+    expect([...projects.querySelectorAll("button")].map((button) => button.textContent)).toEqual([
+      "project-apersonal",
+      "project-bpersonal",
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: /project-a/ }));
+    const environments = await screen.findByRole("heading", { name: "Environments" });
+    expect([...environments.parentElement!.querySelectorAll("button")].map((button) => button.textContent))
+      .toEqual(["env-a", "env-b"]);
+  });
+});

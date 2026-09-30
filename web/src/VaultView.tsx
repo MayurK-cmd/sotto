@@ -116,13 +116,15 @@ export function VaultView({
     try {
       const rows = await fetchProjects();
       setProjects(
-        rows.map((project) => {
-          const key = (project.orgId !== null ? keys.get(project.orgId) : undefined) ?? master;
-          return {
-            project,
-            name: nameOr(project.id, () => decryptProjectName(key, project.id, project.encName)),
-          };
-        }),
+        rows
+          .map((project) => {
+            const key = (project.orgId !== null ? keys.get(project.orgId) : undefined) ?? master;
+            return {
+              project,
+              name: nameOr(project.id, () => decryptProjectName(key, project.id, project.encName)),
+            };
+          })
+          .sort((a, b) => a.name.localeCompare(b.name)),
       );
     } catch (e) {
       setProjects([]);
@@ -178,7 +180,9 @@ export function VaultView({
         return;
       }
       setEnvs(
-        rows.map((env) => ({ env, name: nameOr(env.id, () => decryptEnvName(key, env.id, env.encName)) })),
+        rows
+          .map((env) => ({ env, name: nameOr(env.id, () => decryptEnvName(key, env.id, env.encName)) }))
+          .sort((a, b) => a.name.localeCompare(b.name)),
       );
     } catch (e) {
       if (load !== projectLoad.current) {
