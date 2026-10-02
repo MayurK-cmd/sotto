@@ -20,6 +20,7 @@ use crate::cloud_coverage_reconciliation::{
     SourceBinding, SourceObservation,
 };
 use crate::cloud_coverage_store::PublicationOutcome;
+use crate::cloud_provider_refresh_jobs::{self, RefreshJobError};
 
 /// The provider deployment mode is part of the identity boundary. Test evidence must never enter
 /// a live projection, and vice versa.
@@ -500,6 +501,7 @@ pub async fn accept_provider_invalidation(
     context: &ProviderContext,
     event: &VerifiedProviderEvent,
     allocation: &VerifiedAllocation,
+    ingest_enabled: bool,
 ) -> Result<InvalidationDisposition, ProviderAdapterError> {
     context.validate()?;
     event.validate()?;
@@ -593,9 +595,11 @@ pub async fn accept_provider_invalidation(
         if !same {
             return Err(ProviderAdapterError::InvalidationConflict);
         }
-        return Ok(InvalidationDisposition::AlreadyAccepted {
-            generation: existing.try_get("accepted_generation")?,
-        });
+        let generation = existing.try_get("accepted_generation")?;
+        if ingest_enabled {
+            enqueue_refresh_job(tx, context, event, allocation).await?;
+        }
+        return Ok(InvalidationDisposition::AlreadyAccepted { generation });
     }
 
     let next_generation = generation
@@ -654,9 +658,11 @@ pub async fn accept_provider_invalidation(
         if !same {
             return Err(ProviderAdapterError::InvalidationConflict);
         }
-        return Ok(InvalidationDisposition::AlreadyAccepted {
-            generation: existing.try_get("accepted_generation")?,
-        });
+        let generation = existing.try_get("accepted_generation")?;
+        if ingest_enabled {
+            enqueue_refresh_job(tx, context, event, allocation).await?;
+        }
+        return Ok(InvalidationDisposition::AlreadyAccepted { generation });
     }
     let updated = sqlx::query(
         "UPDATE cloud_coverage_coordinators SET provider_invalidation_generation = $2 \
@@ -670,8 +676,33 @@ pub async fn accept_provider_invalidation(
     if updated.rows_affected() != 1 {
         return Err(ProviderAdapterError::InvalidationConflict);
     }
+    if ingest_enabled {
+        enqueue_refresh_job(tx, context, event, allocation).await?;
+    }
     Ok(InvalidationDisposition::Accepted {
         generation: next_generation,
+    })
+}
+
+async fn enqueue_refresh_job(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ProviderContext,
+    event: &VerifiedProviderEvent,
+    allocation: &VerifiedAllocation,
+) -> Result<(), ProviderAdapterError> {
+    cloud_provider_refresh_jobs::enqueue_event(
+        tx,
+        context,
+        event,
+        &allocation.beneficiary_id,
+        &allocation.allocation_id,
+        &allocation.source_id,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| match error {
+        RefreshJobError::Database(error) => ProviderAdapterError::Database(error),
+        other => ProviderAdapterError::InvalidEvidence(other.to_string()),
     })
 }
 
