@@ -14,6 +14,9 @@ use crate::billing_catalogue::{BillingInterval, BillingOffer};
 
 pub const FOUNDING_CAPACITY: i64 = 100;
 pub const RESERVATION_SECONDS: i64 = 30 * 60;
+/// A Checkout Session is created after the quote, so its expiry may be one quote window beyond
+/// the reservation window while still satisfying Stripe's minimum lifetime.
+pub const MAX_RESERVATION_SECONDS: i64 = RESERVATION_SECONDS * 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FoundingCapacityStatus {
@@ -113,6 +116,41 @@ impl FoundingDate {
             return Err(CalendarError::InvalidDate);
         }
         Self::new(year, month, day)
+    }
+
+    /// Convert a non-negative Unix timestamp to the UTC calendar date used by billing anchors.
+    pub fn from_unix_seconds(seconds: i64) -> Result<Self, CalendarError> {
+        if seconds < 0 {
+            return Err(CalendarError::InvalidDate);
+        }
+        let days = seconds / 86_400;
+        let shifted = days + 719_468;
+        let era = if shifted >= 0 {
+            shifted / 146_097
+        } else {
+            (shifted - 146_096) / 146_097
+        };
+        let day_of_era = shifted - era * 146_097;
+        let year_of_era =
+            (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+        let year = year_of_era + era * 400;
+        let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+        let month_part = (5 * day_of_year + 2) / 153;
+        let day = day_of_year - (153 * month_part + 2) / 5 + 1;
+        let month = month_part + if month_part < 10 { 3 } else { -9 };
+        let year = year + i64::from(month <= 2);
+        Self::new(year as i32, month as u8, day as u8)
+    }
+
+    pub fn to_unix_seconds(self) -> i64 {
+        let year = i64::from(self.year) - i64::from(self.month <= 2);
+        let era = year.div_euclid(400);
+        let year_of_era = year - era * 400;
+        let month = i64::from(self.month);
+        let month_from_march = month + if month > 2 { -3 } else { 9 };
+        let day_of_year = (153 * month_from_march + 2) / 5 + i64::from(self.day) - 1;
+        let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+        (era * 146_097 + day_of_era - 719_468) * 86_400
     }
 
     pub fn add_term(self, offer: FoundingOffer) -> Self {
@@ -263,7 +301,7 @@ pub async fn reserve(
         return Err(FoundingAllocatorError::QuoteExpired);
     }
     let latest_allowed_expiry = now_epoch
-        .checked_add(RESERVATION_SECONDS)
+        .checked_add(MAX_RESERVATION_SECONDS)
         .ok_or(FoundingAllocatorError::InvalidField("now_epoch"))?;
     if quote_expires_at_epoch > latest_allowed_expiry {
         return Err(FoundingAllocatorError::InvalidField("quote_expiry"));
@@ -666,6 +704,14 @@ mod tests {
         assert_eq!(
             leap.add_terms(FoundingOffer::Annual, 4).to_string(),
             "2028-02-29"
+        );
+        assert_eq!(
+            FoundingDate::from_unix_seconds(0).unwrap().to_string(),
+            "1970-01-01"
+        );
+        assert_eq!(
+            FoundingDate::from_unix_seconds(leap.to_unix_seconds()).unwrap(),
+            leap
         );
     }
 
