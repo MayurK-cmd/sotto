@@ -5,7 +5,7 @@ use std::time::Duration;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::tui::app::TuiApp;
@@ -179,7 +179,9 @@ fn draw_left_pane(f: &mut Frame, app: &TuiApp, area: Rect) {
     };
 
     let list = List::new(items).block(list_block);
-    f.render_widget(list, left_chunks[1]);
+    let mut list_state = ListState::default()
+        .with_selected((!app.filtered_indices.is_empty()).then_some(app.selected_filtered_index));
+    f.render_stateful_widget(list, left_chunks[1], &mut list_state);
 }
 
 fn draw_right_pane(f: &mut Frame, app: &TuiApp, area: Rect) {
@@ -1077,6 +1079,40 @@ mod tests {
                 });
             }
         }
+    }
+
+    #[test]
+    fn render_selected_secret_stays_visible_in_list_pane() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::default();
+        let app = App::new(&store, &keychain);
+        for i in 0..30 {
+            app.set(&config, &format!("KEY_{i:02}"), b"value").unwrap();
+        }
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        tui_app.move_selection_end();
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+
+        // At 80 columns the left pane is 42% wide. Inspect only that pane so the
+        // selected name in the right-hand inspector cannot satisfy this check.
+        let buffer = terminal.backend().buffer();
+        let left_pane_width = 80 * 42 / 100;
+        let mut left_pane = String::new();
+        for y in 0..24 {
+            for x in 0..left_pane_width {
+                left_pane.push_str(buffer[(x, y)].symbol());
+            }
+            left_pane.push('\n');
+        }
+
+        assert!(
+            left_pane.contains("KEY_29"),
+            "selected secret must remain visible in the list pane"
+        );
     }
 
     #[test]
