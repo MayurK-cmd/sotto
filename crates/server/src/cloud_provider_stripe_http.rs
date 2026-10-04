@@ -408,7 +408,48 @@ impl StripeReadClient {
         let invoices = self
             .list(session, "v1/invoices", query, parse_invoice)
             .await?;
-        for invoice in &invoices {
+        self.validate_subscription_invoices(&invoices, subscription_id, customer_id)
+    }
+
+    /// Enumerate subscription invoices with a caller-owned record bound.
+    ///
+    /// The bound is enforced while pagination is happening. The result is a recent prefix when
+    /// more invoices exist, so a long-lived subscription does not force an unbounded history read.
+    #[doc(hidden)]
+    pub async fn subscription_invoices_bounded(
+        &self,
+        session: &mut StripeReadSession,
+        subscription_id: &str,
+        customer_id: Option<&str>,
+        max_invoices: usize,
+    ) -> Result<Vec<StripeInvoiceResource>, StripeReadError> {
+        self.ensure_account(session).await?;
+        validate_identifier(subscription_id)?;
+        if max_invoices == 0 {
+            return Err(StripeReadError::InvalidConfig(
+                "subscription invoice bound must be nonzero",
+            ));
+        }
+        if let Some(customer_id) = customer_id {
+            validate_identifier(customer_id)?;
+        }
+        let mut query = vec![("subscription".to_owned(), subscription_id.to_owned())];
+        if let Some(customer_id) = customer_id {
+            query.push(("customer".to_owned(), customer_id.to_owned()));
+        }
+        let invoices = self
+            .list_bounded(session, "v1/invoices", query, parse_invoice, max_invoices)
+            .await?;
+        self.validate_subscription_invoices(&invoices, subscription_id, customer_id)
+    }
+
+    fn validate_subscription_invoices(
+        &self,
+        invoices: &[StripeInvoiceResource],
+        subscription_id: &str,
+        customer_id: Option<&str>,
+    ) -> Result<Vec<StripeInvoiceResource>, StripeReadError> {
+        for invoice in invoices {
             if invoice
                 .subscription_id
                 .as_deref()
@@ -426,7 +467,7 @@ impl StripeReadClient {
             }
             validate_mode(invoice.livemode, self.environment)?;
         }
-        Ok(invoices)
+        Ok(invoices.to_vec())
     }
 
     pub async fn invoice_lines(
@@ -1202,6 +1243,74 @@ impl StripeReadClient {
             credit_notes,
             self.environment,
         )
+    }
+
+    async fn list_bounded<T, F>(
+        &self,
+        session: &mut StripeReadSession,
+        path: &str,
+        base_query: Vec<(String, String)>,
+        parse: F,
+        max_records: usize,
+    ) -> Result<Vec<T>, StripeReadError>
+    where
+        F: Fn(&Value) -> Result<T, StripeReadError> + Copy,
+    {
+        let mut output = Vec::new();
+        let mut ids = HashSet::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            session.add_page(self.limits.max_pages)?;
+            let mut query = base_query.clone();
+            query.push(("limit".to_owned(), "100".to_owned()));
+            if let Some(cursor) = cursor.as_deref() {
+                query.push(("starting_after".to_owned(), cursor.to_owned()));
+            }
+            let page = self
+                .request_json(session, Method::GET, path, &query)
+                .await?;
+            if page.get("object").and_then(Value::as_str) != Some("list") {
+                return Err(StripeReadError::MalformedResponse("list.object"));
+            }
+            let has_more = page
+                .get("has_more")
+                .and_then(Value::as_bool)
+                .ok_or(StripeReadError::MalformedResponse("list.has_more"))?;
+            let data = page
+                .get("data")
+                .and_then(Value::as_array)
+                .ok_or(StripeReadError::MalformedResponse("list.data"))?;
+            if data.is_empty() && has_more {
+                return Err(StripeReadError::InvalidPagination(
+                    "empty page reported with more results",
+                ));
+            }
+            let remaining = max_records.saturating_sub(output.len());
+            let page_data = &data[..data.len().min(remaining)];
+            session.add_records(page_data.len(), self.limits.max_records)?;
+            let mut parsed = Vec::with_capacity(page_data.len());
+            for item in page_data {
+                let id = required_id(item, "list.data.id")?;
+                if !ids.insert(id.clone()) {
+                    return Err(StripeReadError::InvalidPagination("duplicate record id"));
+                }
+                parsed.push((id, parse(item)?));
+            }
+            let last_id = parsed.last().map(|(id, _)| id.clone());
+            output.extend(parsed.into_iter().map(|(_, value)| value));
+            if !has_more || output.len() >= max_records {
+                return Ok(output);
+            }
+            let Some(last_id) = last_id else {
+                return Err(StripeReadError::InvalidPagination(
+                    "missing cursor after nonempty page",
+                ));
+            };
+            if cursor.as_deref() == Some(last_id.as_str()) {
+                return Err(StripeReadError::InvalidPagination("cursor did not advance"));
+            }
+            cursor = Some(last_id);
+        }
     }
 
     async fn list<T, F>(
