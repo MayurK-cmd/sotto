@@ -35,6 +35,7 @@ use crate::config::BillingConfig;
 use crate::error::{Error, Result};
 use crate::founding_allocator::{self, FoundingOffer};
 use crate::personal_billing;
+use crate::sponsored_billing::{self, SponsoredSeatAction, SponsoredSeatRequest};
 use crate::state::AppState;
 use crate::{audit, org};
 
@@ -221,6 +222,49 @@ pub enum SubscriptionObservation {
     Missing,
 }
 
+/// One price-class quantity on the organisation's sponsored subscription.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SponsoredSubscriptionItem {
+    pub provider_item_id: String,
+    pub provider_price_id: String,
+    pub quantity: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SponsoredSubscriptionItemRequest {
+    pub provider_price_id: String,
+    pub quantity: i64,
+}
+
+/// A bounded or open-ended future phase for the organisation's sponsored subscription.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SponsoredSubscriptionPhase {
+    pub start_at_epoch: i64,
+    pub end_at_epoch: Option<i64>,
+    pub items: Vec<SponsoredSubscriptionItemRequest>,
+}
+
+/// Provider state needed to reconcile a sponsored subscription mutation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SponsoredSubscriptionSnapshot {
+    pub customer_id: Option<String>,
+    pub subscription_id: String,
+    pub status: SubscriptionStatus,
+    pub current_period_start: Option<i64>,
+    pub current_period_end: Option<i64>,
+    pub schedule_id: Option<String>,
+    pub items: Vec<SponsoredSubscriptionItem>,
+}
+
+/// The durable identifiers returned while creating the initial hosted subscription.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SponsoredCheckoutSession {
+    pub session_id: String,
+    pub checkout_url: String,
+    pub customer_id: Option<String>,
+    pub subscription_id: Option<String>,
+}
+
 impl SubscriptionObservation {
     pub fn purge_gate(&self) -> PurgeGate {
         match self {
@@ -260,6 +304,54 @@ pub trait SubscriptionProvider: Send + Sync {
         let _ = (price_id, operation_id, idempotency_key, expires_at_epoch);
         self.create_checkout(user_id, customer, success_url, cancel_url)
             .await
+    }
+
+    /// Create the initial named sponsored subscription checkout. All price classes are sent in
+    /// one Checkout Session so an organisation receives one subscription and one invoice.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_sponsored_checkout(
+        &self,
+        _organization_id: &str,
+        _customer: Option<&str>,
+        _items: &[SponsoredSubscriptionItemRequest],
+        _operation_id: &str,
+        _idempotency_key: &str,
+        _expires_at_epoch: i64,
+        _success_url: &str,
+        _cancel_url: &str,
+    ) -> ProviderResult<SponsoredCheckoutSession> {
+        Err(ProviderError::unsupported("sponsored_checkout"))
+    }
+
+    /// Apply the desired named-seat quantities at the next billing boundary. The provider
+    /// implementation uses an explicit subscription schedule so local effective dates and
+    /// Stripe's future invoice agree.
+    async fn update_sponsored_subscription(
+        &self,
+        _organization_id: &str,
+        _subscription_id: &str,
+        _phases: &[SponsoredSubscriptionPhase],
+        _idempotency_key: &str,
+    ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
+        Err(ProviderError::unsupported("sponsored_subscription_update"))
+    }
+
+    async fn get_sponsored_subscription(
+        &self,
+        _subscription_id: &str,
+    ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
+        Err(ProviderError::unsupported("sponsored_subscription_lookup"))
+    }
+
+    async fn cancel_sponsored_subscription(
+        &self,
+        _organization_id: &str,
+        _subscription_id: &str,
+        _idempotency_key: &str,
+    ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
+        Err(ProviderError::unsupported(
+            "sponsored_subscription_cancellation",
+        ))
     }
 
     /// Validate the configured Stripe price before quoting or creating a personal checkout.
@@ -457,6 +549,260 @@ impl SubscriptionProvider for StripeBilling {
             .ok_or_else(ProviderError::malformed_response)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn create_sponsored_checkout(
+        &self,
+        organization_id: &str,
+        customer: Option<&str>,
+        items: &[SponsoredSubscriptionItemRequest],
+        operation_id: &str,
+        idempotency_key: &str,
+        expires_at_epoch: i64,
+        success_url: &str,
+        cancel_url: &str,
+    ) -> ProviderResult<SponsoredCheckoutSession> {
+        if items.is_empty()
+            || items
+                .iter()
+                .any(|item| item.provider_price_id.is_empty() || item.quantity <= 0)
+        {
+            return Err(ProviderError::malformed_response());
+        }
+        let mut form = vec![
+            ("mode".to_string(), "subscription".to_string()),
+            (
+                ("client_reference_id").to_string(),
+                format!("sponsored:{operation_id}"),
+            ),
+            (
+                "subscription_data[metadata][sponsored_operation_id]".to_string(),
+                operation_id.to_string(),
+            ),
+            (
+                "subscription_data[metadata][organization_id]".to_string(),
+                organization_id.to_string(),
+            ),
+            ("success_url".to_string(), success_url.to_string()),
+            ("cancel_url".to_string(), cancel_url.to_string()),
+            ("expires_at".to_string(), expires_at_epoch.to_string()),
+        ];
+        for (index, item) in items.iter().enumerate() {
+            form.push((
+                format!("line_items[{index}][price]"),
+                item.provider_price_id.clone(),
+            ));
+            form.push((
+                format!("line_items[{index}][quantity]"),
+                item.quantity.to_string(),
+            ));
+        }
+        if let Some(customer) = customer {
+            form.push(("customer".to_string(), customer.to_string()));
+        }
+        let session = stripe_post_with_idempotency(
+            &self.api_key,
+            "checkout/sessions",
+            &form,
+            idempotency_key,
+        )
+        .await?;
+        let session_id = session["id"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        let checkout_url = session["url"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        Ok(SponsoredCheckoutSession {
+            session_id: session_id.to_string(),
+            checkout_url: checkout_url.to_string(),
+            customer_id: session["customer"].as_str().map(str::to_string),
+            subscription_id: session["subscription"].as_str().map(str::to_string),
+        })
+    }
+
+    async fn update_sponsored_subscription(
+        &self,
+        organization_id: &str,
+        subscription_id: &str,
+        phases: &[SponsoredSubscriptionPhase],
+        idempotency_key: &str,
+    ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
+        if subscription_id.is_empty()
+            || phases.is_empty()
+            || phases.iter().any(|phase| {
+                phase.start_at_epoch < 0
+                    || phase
+                        .end_at_epoch
+                        .is_some_and(|end| end <= phase.start_at_epoch)
+                    || phase
+                        .items
+                        .iter()
+                        .any(|item| item.provider_price_id.is_empty() || item.quantity < 0)
+            })
+            || phases.windows(2).any(|window| {
+                window[0]
+                    .end_at_epoch
+                    .map(|end| window[1].start_at_epoch < end)
+                    .unwrap_or(true)
+            })
+        {
+            return Err(ProviderError::malformed_response());
+        }
+        let current = self.get_sponsored_subscription(subscription_id).await?;
+        let schedule_id = if let Some(schedule_id) = current.schedule_id.clone() {
+            schedule_id
+        } else {
+            let schedule = stripe_post_with_idempotency(
+                &self.api_key,
+                "subscription_schedules",
+                &[("from_subscription".into(), subscription_id.into())],
+                &format!("{idempotency_key}-schedule"),
+            )
+            .await?;
+            schedule["id"]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(ProviderError::malformed_response)?
+                .to_string()
+        };
+        let current_start = current
+            .current_period_start
+            .ok_or_else(ProviderError::malformed_response)?;
+        let current_end = current
+            .current_period_end
+            .ok_or_else(ProviderError::malformed_response)?;
+        let phase_at_end = phases
+            .iter()
+            .find(|phase| {
+                phase.start_at_epoch <= current_end
+                    && phase.end_at_epoch.is_none_or(|end| current_end < end)
+            })
+            .or_else(|| {
+                phases
+                    .iter()
+                    .find(|phase| phase.start_at_epoch == current_end)
+            })
+            .ok_or_else(ProviderError::malformed_response)?;
+        let mut normalized = Vec::with_capacity(phases.len());
+        normalized.push(SponsoredSubscriptionPhase {
+            start_at_epoch: current_end,
+            end_at_epoch: phase_at_end.end_at_epoch,
+            items: phase_at_end.items.clone(),
+        });
+        normalized.extend(
+            phases
+                .iter()
+                .filter(|phase| phase.start_at_epoch > current_end)
+                .cloned(),
+        );
+        if normalized.windows(2).any(|window| {
+            window[0]
+                .end_at_epoch
+                .is_some_and(|end| end != window[1].start_at_epoch)
+        }) {
+            return Err(ProviderError::malformed_response());
+        }
+        let final_empty = normalized
+            .last()
+            .is_some_and(|phase| phase.items.is_empty());
+        if normalized
+            .iter()
+            .take(if final_empty {
+                normalized.len().saturating_sub(1)
+            } else {
+                normalized.len()
+            })
+            .any(|phase| phase.items.is_empty())
+        {
+            return Err(ProviderError::malformed_response());
+        }
+        if final_empty {
+            normalized.pop();
+        }
+        let mut form = vec![
+            (
+                "end_behavior".into(),
+                if final_empty { "cancel" } else { "release" }.into(),
+            ),
+            ("proration_behavior".into(), "none".into()),
+            ("metadata[organization_id]".into(), organization_id.into()),
+            ("phases[0][start_date]".into(), current_start.to_string()),
+            ("phases[0][end_date]".into(), current_end.to_string()),
+        ];
+        for (index, item) in current.items.iter().enumerate() {
+            form.push((
+                format!("phases[0][items][{index}][price]"),
+                item.provider_price_id.clone(),
+            ));
+            form.push((
+                format!("phases[0][items][{index}][quantity]"),
+                item.quantity.to_string(),
+            ));
+        }
+        for (phase_index, phase) in normalized.iter().enumerate() {
+            let index = phase_index + 1;
+            form.push((
+                format!("phases[{index}][start_date]"),
+                phase.start_at_epoch.to_string(),
+            ));
+            if let Some(end) = phase.end_at_epoch {
+                form.push((format!("phases[{index}][end_date]"), end.to_string()));
+            }
+            for (item_index, item) in phase.items.iter().enumerate() {
+                form.push((
+                    format!("phases[{index}][items][{item_index}][price]"),
+                    item.provider_price_id.clone(),
+                ));
+                form.push((
+                    format!("phases[{index}][items][{item_index}][quantity]"),
+                    item.quantity.to_string(),
+                ));
+            }
+        }
+        stripe_post_with_idempotency(
+            &self.api_key,
+            &format!("subscription_schedules/{schedule_id}"),
+            &form,
+            idempotency_key,
+        )
+        .await?;
+        self.get_sponsored_subscription(subscription_id).await
+    }
+
+    async fn get_sponsored_subscription(
+        &self,
+        subscription_id: &str,
+    ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
+        let value = stripe_get(&self.api_key, &format!("subscriptions/{subscription_id}")).await?;
+        sponsored_subscription_snapshot(&value, subscription_id)
+    }
+
+    async fn cancel_sponsored_subscription(
+        &self,
+        organization_id: &str,
+        subscription_id: &str,
+        idempotency_key: &str,
+    ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
+        let form = vec![
+            ("invoice_now".into(), "false".into()),
+            ("prorate".into(), "false".into()),
+            (
+                "cancellation_details[comment]".into(),
+                format!("Sotto sponsored billing for organisation {organization_id}"),
+            ),
+        ];
+        stripe_delete(
+            &self.api_key,
+            &format!("subscriptions/{subscription_id}"),
+            idempotency_key,
+            &form,
+        )
+        .await?;
+        self.get_sponsored_subscription(subscription_id).await
+    }
+
     async fn validate_personal_price(
         &self,
         price_id: &str,
@@ -629,6 +975,22 @@ pub fn router() -> Router<AppState> {
     let router = Router::new()
         .route("/orgs/{org_id}/billing/checkout", post(create_checkout))
         .route("/orgs/{org_id}/billing/portal", post(create_portal))
+        .route(
+            "/orgs/{org_id}/billing/sponsored/seats",
+            get(sponsored_seats),
+        )
+        .route(
+            "/orgs/{org_id}/billing/sponsored/quote",
+            post(sponsored_quote),
+        )
+        .route(
+            "/orgs/{org_id}/billing/sponsored/checkout",
+            post(sponsored_checkout),
+        )
+        .route(
+            "/orgs/{org_id}/billing/sponsored/operations/{operation_id}",
+            get(sponsored_operation),
+        )
         .route("/billing/personal/quote", get(personal_quote))
         .route("/billing/personal/checkout", post(personal_checkout))
         .route(
@@ -652,6 +1014,21 @@ fn billing_config(state: &AppState) -> Result<&BillingState> {
         .billing
         .as_ref()
         .ok_or_else(|| Error::NotConfigured("billing is not configured".into()))
+}
+
+const SPONSORED_BILLING_ENABLED_ENV: &str = "SOTTO_SPONSORED_BILLING_ENABLED";
+
+fn sponsored_billing_enabled() -> bool {
+    std::env::var(SPONSORED_BILLING_ENABLED_ENV).as_deref() == Ok("1")
+}
+
+fn sponsored_billing_config(state: &AppState) -> Result<&BillingState> {
+    if !sponsored_billing_enabled() {
+        return Err(Error::NotConfigured(
+            "hosted sponsored billing is not enabled".into(),
+        ));
+    }
+    billing_config(state)
 }
 
 /// Billing is admin+: the same bar as membership management, and a non-member sees a 404.
@@ -722,6 +1099,307 @@ fn billing_offer(value: &str) -> Result<BillingOffer> {
         .ok_or_else(|| Error::BadRequest("unsupported billing offer".into()))
 }
 
+#[derive(Debug, Deserialize)]
+struct SponsoredQuoteRequest {
+    action: String,
+    offer: String,
+    beneficiary_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SponsoredQuoteView {
+    action: String,
+    seat_count: i64,
+    amount_pence: i64,
+    currency: &'static str,
+    interval: &'static str,
+    quote_version: i64,
+    quote_expires_at_epoch: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct SponsoredSeatView {
+    seat_id: String,
+    beneficiary_id: String,
+    offer: String,
+    effective_from: i64,
+    effective_until: Option<i64>,
+    state: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SponsoredCheckoutRequest {
+    action: String,
+    offer: String,
+    beneficiary_id: String,
+    replacement_beneficiary_id: Option<String>,
+    quote_version: i64,
+    quote_expires_at_epoch: i64,
+    effective_from: i64,
+    effective_until: Option<i64>,
+    idempotency_key: String,
+    return_url: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SponsoredOperationView {
+    operation_id: String,
+    action: String,
+    state: String,
+    provider_checkout_url: Option<String>,
+}
+
+async fn sponsored_seats(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(org_id): Path<String>,
+) -> Result<Json<Vec<SponsoredSeatView>>> {
+    sponsored_billing_config(&state)?;
+    let seats = sponsored_billing::list_seats(&state.pool, &org_id, &user.user_id)
+        .await
+        .map_err(Error::from)?;
+    Ok(Json(
+        seats
+            .into_iter()
+            .map(|seat| SponsoredSeatView {
+                seat_id: seat.seat_id,
+                beneficiary_id: seat.beneficiary_id,
+                offer: seat.offer.as_str().into(),
+                effective_from: seat.effective_from,
+                effective_until: seat.effective_until,
+                state: seat.state.as_str().into(),
+            })
+            .collect(),
+    ))
+}
+
+async fn sponsored_quote(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(org_id): Path<String>,
+    Json(request): Json<SponsoredQuoteRequest>,
+) -> Result<Json<SponsoredQuoteView>> {
+    let action = SponsoredSeatAction::parse(&request.action).map_err(Error::from)?;
+    if request.beneficiary_ids.is_empty()
+        || request
+            .beneficiary_ids
+            .iter()
+            .any(|beneficiary| beneficiary.trim().is_empty())
+        || request
+            .beneficiary_ids
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != request.beneficiary_ids.len()
+    {
+        return Err(Error::BadRequest(
+            "beneficiary_ids must contain unique existing accounts".into(),
+        ));
+    }
+    let offer = billing_offer(&request.offer)?;
+    let billing = sponsored_billing_config(&state)?;
+    let catalogue = billing
+        .price_catalogue()
+        .ok_or_else(|| Error::NotConfigured("hosted sponsored billing is not configured".into()))?;
+    validate_personal_catalogue(billing, catalogue).await?;
+    let access = org::access(&state.pool, &org_id, &user.user_id).await?;
+    access.require_write()?;
+    if !access.role().can_manage_members() {
+        return Err(Error::Forbidden(
+            "managing sponsored billing requires the admin or owner role".into(),
+        ));
+    }
+    for beneficiary_id in &request.beneficiary_ids {
+        let exists: Option<String> = sqlx::query_scalar("SELECT id FROM users WHERE id = $1")
+            .bind(beneficiary_id)
+            .fetch_optional(&state.pool)
+            .await?;
+        if exists.is_none() {
+            return Err(Error::NotFound("sponsored beneficiary not found".into()));
+        }
+    }
+    let quote = sponsored_billing::quote(
+        action,
+        offer,
+        request.beneficiary_ids.len(),
+        sponsored_billing::current_epoch(),
+    )
+    .map_err(Error::from)?;
+    Ok(Json(SponsoredQuoteView {
+        action: quote.action.as_str().into(),
+        seat_count: quote.seat_count,
+        amount_pence: quote.amount_pence,
+        currency: quote.currency,
+        interval: quote.interval,
+        quote_version: quote.quote_version,
+        quote_expires_at_epoch: quote.quote_expires_at_epoch,
+    }))
+}
+
+async fn sponsored_checkout(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(org_id): Path<String>,
+    Json(input): Json<SponsoredCheckoutRequest>,
+) -> Result<Json<SponsoredOperationView>> {
+    let billing = sponsored_billing_config(&state)?;
+    let catalogue = billing
+        .price_catalogue()
+        .ok_or_else(|| Error::NotConfigured("hosted sponsored billing is not configured".into()))?;
+    let action = SponsoredSeatAction::parse(&input.action).map_err(Error::from)?;
+    let offer = billing_offer(&input.offer)?;
+    validate_personal_catalogue(billing, catalogue).await?;
+    let request = SponsoredSeatRequest {
+        action,
+        beneficiary_id: input.beneficiary_id,
+        replacement_beneficiary_id: input.replacement_beneficiary_id,
+        offer,
+        quote_version: input.quote_version,
+        quote_expires_at_epoch: input.quote_expires_at_epoch,
+        effective_from: input.effective_from,
+        effective_until: input.effective_until,
+        idempotency_key: input.idempotency_key,
+    };
+    billing_operations::validate_return_url(&billing.return_url, &input.return_url)
+        .map_err(Error::from)?;
+    let now = sponsored_billing::current_epoch();
+    let mut tx = state.pool.begin().await?;
+    let operation =
+        sponsored_billing::begin_operation(&mut tx, &org_id, &user.user_id, &request, now)
+            .await
+            .map_err(Error::from)?;
+    if operation.state != "pending" {
+        tx.rollback().await?;
+        return Ok(Json(SponsoredOperationView {
+            operation_id: operation.operation_id,
+            action: operation.action.as_str().into(),
+            state: operation.state,
+            provider_checkout_url: operation.provider_checkout_url,
+        }));
+    }
+    let existing_subscription: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT provider_customer_id, provider_subscription_id \
+         FROM billing_sponsored_subscriptions \
+         WHERE organization_id = $1 AND provider_subscription_id IS NOT NULL \
+           AND status IN ('pending', 'active', 'past_due') FOR UPDATE",
+    )
+    .bind(&org_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let existing_customer: Option<String> =
+        sqlx::query_scalar("SELECT stripe_customer_id FROM organizations WHERE id = $1")
+            .bind(&org_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    tx.commit().await?;
+
+    let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
+    let result = if let Some((customer_id, Some(subscription_id))) = existing_subscription {
+        let phases = sponsored_provider_phases(
+            &state.pool,
+            &org_id,
+            catalogue,
+            sponsored_billing::current_epoch(),
+        )
+        .await?;
+        let snapshot = billing
+            .provider
+            .update_sponsored_subscription(
+                &org_id,
+                &subscription_id,
+                &phases,
+                &operation.provider_idempotency_key,
+            )
+            .await
+            .map_err(ProviderError::into_error)?;
+        let mut result_tx = state.pool.begin().await?;
+        let operation = sponsored_billing::record_provider_update(
+            &mut result_tx,
+            &operation.operation_id,
+            customer_id.as_deref().or(snapshot.customer_id.as_deref()),
+            &subscription_id,
+            snapshot.schedule_id.as_deref(),
+            snapshot.current_period_end,
+            None,
+        )
+        .await
+        .map_err(Error::from)?;
+        result_tx.commit().await?;
+        SponsoredOperationView {
+            operation_id: operation.operation_id,
+            action: operation.action.as_str().into(),
+            state: operation.state,
+            provider_checkout_url: operation.provider_checkout_url,
+        }
+    } else if existing_subscription.is_none() && action == SponsoredSeatAction::Add {
+        let items = sponsored_provider_items(&state.pool, &org_id, catalogue, &operation).await?;
+        let checkout = billing
+            .provider
+            .create_sponsored_checkout(
+                &org_id,
+                existing_customer.as_deref(),
+                &items,
+                &operation.operation_id,
+                &operation.provider_idempotency_key,
+                personal_checkout_expiry(
+                    operation.quote_expires_at_epoch,
+                    sponsored_billing::current_epoch(),
+                )?,
+                &success_url,
+                &cancel_url,
+            )
+            .await
+            .map_err(ProviderError::into_error)?;
+        let mut result_tx = state.pool.begin().await?;
+        let operation = sponsored_billing::record_checkout(
+            &mut result_tx,
+            &operation.operation_id,
+            &checkout.checkout_url,
+            &checkout.session_id,
+            checkout.customer_id.as_deref(),
+            checkout.subscription_id.as_deref(),
+        )
+        .await
+        .map_err(Error::from)?;
+        result_tx.commit().await?;
+        SponsoredOperationView {
+            operation_id: operation.operation_id,
+            action: operation.action.as_str().into(),
+            state: operation.state,
+            provider_checkout_url: operation.provider_checkout_url,
+        }
+    } else {
+        return Err(Error::Conflict(
+            "sponsored subscription is missing for this change".into(),
+        ));
+    };
+    Ok(Json(result))
+}
+
+async fn sponsored_operation(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path((org_id, operation_id)): Path<(String, String)>,
+) -> Result<Json<SponsoredOperationView>> {
+    sponsored_billing_config(&state)?;
+    let operation =
+        sponsored_billing::load_operation_for_actor(&state.pool, &operation_id, &user.user_id)
+            .await
+            .map_err(Error::from)?
+            .ok_or_else(|| Error::NotFound("sponsored billing operation not found".into()))?;
+    if operation.organization_id != org_id {
+        return Err(Error::NotFound(
+            "sponsored billing operation not found".into(),
+        ));
+    }
+    Ok(Json(SponsoredOperationView {
+        operation_id: operation.operation_id,
+        action: operation.action.as_str().into(),
+        state: operation.state,
+        provider_checkout_url: operation.provider_checkout_url,
+    }))
+}
+
 async fn validate_personal_catalogue(
     billing: &BillingState,
     catalogue: &BillingPriceIds,
@@ -734,6 +1412,118 @@ async fn validate_personal_catalogue(
             .map_err(ProviderError::into_error)?;
     }
     Ok(())
+}
+
+async fn sponsored_provider_items(
+    pool: &sqlx::PgPool,
+    organization_id: &str,
+    catalogue: &BillingPriceIds,
+    operation: &sponsored_billing::SponsoredOperation,
+) -> Result<Vec<SponsoredSubscriptionItemRequest>> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT offer, count(*)::BIGINT FROM billing_sponsored_seats \
+         WHERE organization_id = $1 AND state IN ('active', 'pending') \
+           AND NOT ($2 IN ('remove', 'replace') AND beneficiary_id = $3) \
+         GROUP BY offer ORDER BY offer",
+    )
+    .bind(organization_id)
+    .bind(operation.action.as_str())
+    .bind(&operation.beneficiary_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|(offer, quantity)| {
+            let offer = billing_offer(&offer)?;
+            Ok(SponsoredSubscriptionItemRequest {
+                provider_price_id: catalogue.id_for(offer).to_string(),
+                quantity,
+            })
+        })
+        .collect()
+}
+
+/// Build the complete future seat schedule from Sotto's interval ledger. Stripe's current
+/// quantities describe only the provider's present phase; rebuilding a schedule from them loses
+/// an earlier removal or a later finite seat boundary whenever two changes are pending together.
+async fn sponsored_provider_phases(
+    pool: &sqlx::PgPool,
+    organization_id: &str,
+    catalogue: &BillingPriceIds,
+    now_epoch: i64,
+) -> Result<Vec<SponsoredSubscriptionPhase>> {
+    let mut rows: Vec<(String, String, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT beneficiary_id, offer, effective_from, effective_until \
+         FROM billing_sponsored_seats \
+         WHERE organization_id = $1 AND state IN ('active', 'pending', 'scheduled_removal') \
+         ORDER BY effective_from, seat_id",
+    )
+    .bind(organization_id)
+    .fetch_all(pool)
+    .await?;
+
+    // Removal and replacement rows are not marked scheduled_removal until the provider accepts
+    // their schedule. Apply every still-live operation in memory so a second mutation cannot
+    // rebuild Stripe's schedule without an earlier pending change.
+    let pending_changes: Vec<(String, String, Option<i64>)> = sqlx::query_as(
+        "SELECT beneficiary_id, action, effective_until \
+         FROM billing_sponsored_operations \
+         WHERE organization_id = $1 AND state IN ('pending', 'checkout_created', 'provider_pending') \
+           AND action IN ('remove', 'replace') ORDER BY created_at",
+    )
+    .bind(organization_id)
+    .fetch_all(pool)
+    .await?;
+    for (beneficiary_id, _, effective_until) in pending_changes {
+        for row in &mut rows {
+            if row.0 == beneficiary_id {
+                row.3 = effective_until;
+            }
+        }
+    }
+
+    let mut boundaries = std::collections::BTreeSet::from([now_epoch]);
+    for (_, _, effective_from, effective_until) in &rows {
+        if *effective_from > now_epoch {
+            boundaries.insert(*effective_from);
+        }
+        if let Some(effective_until) = effective_until.filter(|until| *until > now_epoch) {
+            boundaries.insert(effective_until);
+        }
+    }
+    let boundaries: Vec<i64> = boundaries.into_iter().collect();
+    let mut phases = Vec::with_capacity(boundaries.len());
+    for (index, start_at_epoch) in boundaries.iter().copied().enumerate() {
+        let end_at_epoch = boundaries.get(index + 1).copied();
+        let mut quantities = std::collections::BTreeMap::<String, i64>::new();
+        for (_, offer, effective_from, effective_until) in &rows {
+            if *effective_from <= start_at_epoch
+                && effective_until
+                    .map(|effective_until| start_at_epoch < effective_until)
+                    .unwrap_or(true)
+            {
+                let quantity = quantities.entry(offer.clone()).or_default();
+                *quantity = quantity
+                    .checked_add(1)
+                    .ok_or_else(|| Error::BadRequest("sponsored seat count is too large".into()))?;
+            }
+        }
+        let items = quantities
+            .into_iter()
+            .map(|(offer, quantity)| {
+                let offer = billing_offer(&offer)?;
+                Ok(SponsoredSubscriptionItemRequest {
+                    provider_price_id: catalogue.id_for(offer).to_string(),
+                    quantity,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        phases.push(SponsoredSubscriptionPhase {
+            start_at_epoch,
+            end_at_epoch,
+            items,
+        });
+    }
+    Ok(phases)
 }
 
 fn billing_epoch() -> i64 {
@@ -1425,6 +2215,46 @@ fn subscription_snapshot(
     })
 }
 
+fn sponsored_subscription_snapshot(
+    object: &serde_json::Value,
+    requested_id: &str,
+) -> ProviderResult<SponsoredSubscriptionSnapshot> {
+    let base = subscription_snapshot(object, requested_id)?;
+    let items = object["items"]["data"]
+        .as_array()
+        .ok_or_else(ProviderError::malformed_response)?
+        .iter()
+        .map(|item| {
+            let provider_item_id = item["id"]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(ProviderError::malformed_response)?;
+            let provider_price_id = item["price"]["id"]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(ProviderError::malformed_response)?;
+            let quantity = item["quantity"]
+                .as_i64()
+                .filter(|value| *value >= 0)
+                .ok_or_else(ProviderError::malformed_response)?;
+            Ok(SponsoredSubscriptionItem {
+                provider_item_id: provider_item_id.to_string(),
+                provider_price_id: provider_price_id.to_string(),
+                quantity,
+            })
+        })
+        .collect::<ProviderResult<Vec<_>>>()?;
+    Ok(SponsoredSubscriptionSnapshot {
+        customer_id: object["customer"].as_str().map(str::to_string),
+        subscription_id: base.id,
+        status: base.status,
+        current_period_start: subscription_period_start(object),
+        current_period_end: subscription_period_end(object),
+        schedule_id: object["schedule"].as_str().map(str::to_string),
+        items,
+    })
+}
+
 fn cancellation_form(org_id: &str) -> Vec<(String, String)> {
     vec![
         ("invoice_now".into(), "false".into()),
@@ -1552,8 +2382,29 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
     } else {
         None
     };
+    let sponsored_snapshot = if sponsored_billing_enabled() && is_sponsored_checkout_event(&event) {
+        if let Some(subscription_id) = subscription_id.as_deref() {
+            Some(
+                billing
+                    .provider
+                    .get_sponsored_subscription(subscription_id)
+                    .await
+                    .map_err(ProviderError::into_error)?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     if disposition == EventDisposition::Reconcile {
-        if is_personal_checkout_event(&event) {
+        if is_sponsored_checkout_expired_event(&event) {
+            sponsored_checkout_expired(&mut tx, object).await?;
+            mark_webhook_event_processed(&mut tx, &event.id).await?;
+            tx.commit().await?;
+            return Ok(());
+        }
+        if is_personal_checkout_event(&event) || is_sponsored_checkout_event(&event) {
             // A personal checkout has no organisation tier to reconcile. Re-apply the verified
             // settlement instead; the personal account store makes this equal-timestamp replay
             // idempotent while still requiring the paid webhook evidence.
@@ -1563,6 +2414,7 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
                 event.created,
                 event.kind == "checkout.session.async_payment_succeeded",
                 personal_period_end,
+                sponsored_snapshot.as_ref(),
             )
             .await?;
             if let Some(subscription_id) = subscription_id {
@@ -1589,6 +2441,7 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
             observation,
             &subscription_id,
             event_org_hint(&event),
+            event_is_sponsored_subscription(&event),
         )
         .await?;
         update_subscription_watermark(&mut tx, &event, &subscription_id).await?;
@@ -1606,12 +2459,14 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
                     event.created,
                     event.kind == "checkout.session.async_payment_succeeded",
                     personal_period_end,
+                    sponsored_snapshot.as_ref(),
                 )
                 .await?
             }
+            "checkout.session.expired" => sponsored_checkout_expired(&mut tx, object).await?,
             "customer.subscription.updated" => subscription_updated(&mut tx, object).await?,
             "customer.subscription.deleted" => subscription_deleted(&mut tx, object).await?,
-            "invoice.paid" => invoice_paid(&mut tx, object).await?,
+            "invoice.paid" => invoice_paid(&mut tx, object, billing.price_catalogue()).await?,
             _ => {}
         },
         EventDisposition::Reconcile | EventDisposition::Ignore => {
@@ -1657,7 +2512,10 @@ async fn record_webhook_event(
         }
     }
 
-    if is_personal_checkout_event(event) {
+    if is_personal_checkout_event(event)
+        || is_sponsored_checkout_event(event)
+        || is_sponsored_checkout_expired_event(event)
+    {
         return Ok(EventDisposition::Apply);
     }
     if event.kind == "invoice.paid" {
@@ -1801,11 +2659,21 @@ fn event_org_hint(event: &Event) -> Option<&str> {
         "checkout.session.completed" | "checkout.session.async_payment_succeeded" => {
             event.data.object["client_reference_id"].as_str()
         }
-        "customer.subscription.updated" | "customer.subscription.deleted" => {
-            event.data.object["metadata"]["org_id"].as_str()
-        }
+        "customer.subscription.updated" | "customer.subscription.deleted" => event.data.object
+            ["metadata"]["organization_id"]
+            .as_str()
+            .or_else(|| event.data.object["metadata"]["org_id"].as_str()),
         _ => None,
     }
+}
+
+fn event_is_sponsored_subscription(event: &Event) -> bool {
+    matches!(
+        event.kind.as_str(),
+        "customer.subscription.updated" | "customer.subscription.deleted"
+    ) && event.data.object["metadata"]["organization_id"]
+        .as_str()
+        .is_some()
 }
 
 fn is_personal_checkout_event(event: &Event) -> bool {
@@ -1817,6 +2685,41 @@ fn is_personal_checkout_event(event: &Event) -> bool {
         .is_some_and(|reference| reference.starts_with("personal:"))
 }
 
+fn is_sponsored_checkout_event(event: &Event) -> bool {
+    matches!(
+        event.kind.as_str(),
+        "checkout.session.completed" | "checkout.session.async_payment_succeeded"
+    ) && event.data.object["client_reference_id"]
+        .as_str()
+        .is_some_and(|reference| reference.starts_with("sponsored:"))
+}
+
+fn is_sponsored_checkout_expired_event(event: &Event) -> bool {
+    event.kind == "checkout.session.expired"
+        && event.data.object["client_reference_id"]
+            .as_str()
+            .is_some_and(|reference| reference.starts_with("sponsored:"))
+}
+
+async fn sponsored_checkout_expired(
+    tx: &mut Transaction<'_, Postgres>,
+    object: &serde_json::Value,
+) -> Result<()> {
+    if !sponsored_billing_enabled() {
+        return Ok(());
+    }
+    let Some(reference) = object["client_reference_id"].as_str() else {
+        return Ok(());
+    };
+    let Some(operation_id) = reference.strip_prefix("sponsored:") else {
+        return Ok(());
+    };
+    sponsored_billing::cancel_failed_operation(tx, operation_id, "checkout_expired")
+        .await
+        .map_err(Error::from)?;
+    Ok(())
+}
+
 /// A paid checkout: record the Stripe ids and grant the Team tier. Idempotent - a redelivered
 /// event changes no rows and writes no duplicate audit entry.
 async fn checkout_completed(
@@ -1825,6 +2728,7 @@ async fn checkout_completed(
     event_created: i64,
     async_payment_succeeded: bool,
     personal_period_end: Option<i64>,
+    sponsored_snapshot: Option<&SponsoredSubscriptionSnapshot>,
 ) -> Result<()> {
     // Sessions this server creates always carry the org id; anything else isn't ours to act on.
     // Said out loud, because ignoring an event and acting on one are indistinguishable from
@@ -1847,6 +2751,41 @@ async fn checkout_completed(
             personal_period_end,
         )
         .await;
+    }
+    if let Some(operation_id) = org_id.strip_prefix("sponsored:") {
+        if !sponsored_billing_enabled() {
+            return Ok(());
+        }
+        if !async_payment_succeeded && object["payment_status"].as_str() != Some("paid") {
+            return Ok(());
+        }
+        let payment_reference = object["payment_intent"]
+            .as_str()
+            .or_else(|| object["id"].as_str())
+            .ok_or_else(|| {
+                Error::Config("paid sponsored checkout has no payment reference".into())
+            })?;
+        let subscription_id = object["subscription"]
+            .as_str()
+            .or_else(|| sponsored_snapshot.map(|snapshot| snapshot.subscription_id.as_str()))
+            .ok_or_else(|| Error::Config("sponsored checkout has no subscription id".into()))?;
+        let evidence = sponsored_billing::SponsoredProviderEvidence {
+            customer_id: object["customer"]
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| sponsored_snapshot.and_then(|snapshot| snapshot.customer_id.clone())),
+            subscription_id: subscription_id.to_string(),
+            schedule_id: sponsored_snapshot.and_then(|snapshot| snapshot.schedule_id.clone()),
+            checkout_session_id: object["id"].as_str().map(str::to_string),
+            payment_reference: payment_reference.to_string(),
+            provider_item_id: sponsored_snapshot.and_then(|snapshot| {
+                (snapshot.items.len() == 1).then(|| snapshot.items[0].provider_item_id.clone())
+            }),
+        };
+        sponsored_billing::complete_paid_checkout(tx, operation_id, &evidence)
+            .await
+            .map_err(Error::from)?;
+        return Ok(());
     }
     let customer = object["customer"].as_str();
     let subscription = object["subscription"].as_str();
@@ -2001,6 +2940,138 @@ async fn personal_checkout_completed(
 
 /// A subscription lifecycle change: the status decides the tier. Handles late/failed payments
 /// (`unpaid` → free) and recoveries (`active` again → team).
+fn sponsored_subscription_status(status: SubscriptionStatus) -> Option<(&'static str, bool)> {
+    match status {
+        SubscriptionStatus::Active | SubscriptionStatus::Trialing => Some(("active", false)),
+        SubscriptionStatus::PastDue | SubscriptionStatus::Paused => Some(("past_due", false)),
+        SubscriptionStatus::Incomplete => Some(("pending", false)),
+        SubscriptionStatus::Unpaid
+        | SubscriptionStatus::Canceled
+        | SubscriptionStatus::IncompleteExpired => Some(("canceled", true)),
+        SubscriptionStatus::Unknown(_) => None,
+    }
+}
+
+async fn sponsored_subscription_organization(
+    tx: &mut Transaction<'_, Postgres>,
+    object: &serde_json::Value,
+) -> Result<Option<String>> {
+    let Some(subscription_id) = object["id"].as_str() else {
+        return Ok(None);
+    };
+    let metadata_organization = object["metadata"]["organization_id"].as_str();
+    let stored_organization: Option<String> = sqlx::query_scalar(
+        "SELECT organization_id FROM billing_sponsored_subscriptions \
+         WHERE provider_subscription_id = $1",
+    )
+    .bind(subscription_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(stored_organization) = stored_organization {
+        return Ok(Some(stored_organization));
+    }
+    let Some(metadata_organization) = metadata_organization else {
+        return Ok(None);
+    };
+    Ok(sqlx::query_scalar(
+        "SELECT organization_id FROM billing_sponsored_subscriptions \
+         WHERE organization_id = $1",
+    )
+    .bind(metadata_organization)
+    .fetch_optional(&mut **tx)
+    .await?)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_sponsored_subscription_state(
+    tx: &mut Transaction<'_, Postgres>,
+    organization_id: &str,
+    subscription_id: &str,
+    status: &str,
+    terminal: bool,
+    customer_id: Option<&str>,
+    schedule_id: Option<&str>,
+    period_start: Option<i64>,
+    period_end: Option<i64>,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE billing_sponsored_subscriptions SET \
+           provider_customer_id = COALESCE($2, provider_customer_id), \
+           provider_subscription_id = CASE WHEN $3 THEN NULL ELSE $4 END, \
+           provider_schedule_id = CASE WHEN $3 THEN NULL ELSE COALESCE($5, provider_schedule_id) END, \
+           status = $6, current_period_start = COALESCE($7, current_period_start), \
+           current_period_end = COALESCE($8, current_period_end), updated_at = now() \
+         WHERE organization_id = $1",
+    )
+    .bind(organization_id)
+    .bind(customer_id)
+    .bind(terminal)
+    .bind(subscription_id)
+    .bind(schedule_id)
+    .bind(status)
+    .bind(period_start)
+    .bind(period_end)
+    .execute(&mut **tx)
+    .await?;
+    if terminal {
+        sqlx::query(
+            "UPDATE billing_sponsored_seats SET state = 'canceled', \
+             effective_until = COALESCE(effective_until, $2, floor(extract(epoch FROM now()))::BIGINT), \
+             updated_at = now() \
+             WHERE organization_id = $1 AND state IN ('active', 'pending', 'scheduled_removal')",
+        )
+        .bind(organization_id)
+        .bind(period_end)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn sponsored_subscription_updated(
+    tx: &mut Transaction<'_, Postgres>,
+    object: &serde_json::Value,
+) -> Result<bool> {
+    let Some(organization_id) = sponsored_subscription_organization(tx, object).await? else {
+        return Ok(false);
+    };
+    let Some(subscription_id) = object["id"].as_str() else {
+        return Ok(false);
+    };
+    let Some(status) = object["status"].as_str() else {
+        return Ok(true);
+    };
+    let Some((mapped_status, terminal)) =
+        sponsored_subscription_status(SubscriptionStatus::parse(status))
+    else {
+        return Ok(true);
+    };
+    apply_sponsored_subscription_state(
+        tx,
+        &organization_id,
+        subscription_id,
+        mapped_status,
+        terminal,
+        object["customer"].as_str(),
+        object["schedule"].as_str(),
+        subscription_period_start(object),
+        subscription_period_end(object),
+    )
+    .await?;
+    audit::record_tx(
+        &mut *tx,
+        &organization_id,
+        "stripe",
+        "billing.sponsored_updated",
+        audit::Context {
+            detail: Some("sponsored subscription lifecycle state updated"),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(true)
+}
+
 async fn subscription_updated(
     tx: &mut Transaction<'_, Postgres>,
     object: &serde_json::Value,
@@ -2036,6 +3107,14 @@ async fn subscription_updated(
         .bind(subscription_id)
         .execute(&mut **tx)
         .await?;
+        return Ok(());
+    }
+    if sponsored_subscription_updated(tx, object).await? {
+        return Ok(());
+    }
+    // A sponsored subscription can emit lifecycle events before its paid checkout creates the
+    // durable row. It is not a legacy subscription, so never let this event change the Team tier.
+    if object["metadata"]["organization_id"].as_str().is_some() {
         return Ok(());
     }
     let Some(org_id) = org_for_subscription(tx, object).await? else {
@@ -2078,6 +3157,15 @@ async fn subscription_updated(
 /// Since Stripe API 2025-03-31.basil, subscription billing periods live on the subscription
 /// items rather than on the subscription object. Personal checkout creates one item, but taking
 /// the furthest item end keeps the stored term safe if that shape ever gains another item.
+fn subscription_period_start(object: &serde_json::Value) -> Option<i64> {
+    object["items"]["data"]
+        .as_array()?
+        .iter()
+        .filter_map(|item| item["current_period_start"].as_i64())
+        .filter(|start| *start >= 0)
+        .min()
+}
+
 fn subscription_period_end(object: &serde_json::Value) -> Option<i64> {
     object["items"]["data"]
         .as_array()?
@@ -2120,10 +3208,16 @@ fn invoice_subscription_id(object: &serde_json::Value) -> Option<&str> {
 async fn invoice_paid(
     tx: &mut Transaction<'_, Postgres>,
     object: &serde_json::Value,
+    catalogue: Option<&BillingPriceIds>,
 ) -> Result<()> {
     let Some(subscription_id) = invoice_subscription_id(object) else {
         return Ok(());
     };
+    if sponsored_billing_enabled()
+        && sponsored_invoice_paid(tx, object, subscription_id, catalogue).await?
+    {
+        return Ok(());
+    }
     let personal: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM billing_personal_accounts \
          WHERE stripe_subscription_id = $1)",
@@ -2154,6 +3248,117 @@ async fn invoice_paid(
     Ok(())
 }
 
+async fn sponsored_invoice_paid(
+    tx: &mut Transaction<'_, Postgres>,
+    object: &serde_json::Value,
+    subscription_id: &str,
+    catalogue: Option<&BillingPriceIds>,
+) -> Result<bool> {
+    let Some(catalogue) = catalogue else {
+        return Err(Error::NotConfigured(
+            "sponsored billing price catalogue is not configured".into(),
+        ));
+    };
+    let organization_id: Option<String> = sqlx::query_scalar(
+        "SELECT organization_id FROM billing_sponsored_subscriptions \
+         WHERE provider_subscription_id = $1 FOR UPDATE",
+    )
+    .bind(subscription_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(organization_id) = organization_id else {
+        return Ok(false);
+    };
+    let payment_reference = object["payment_intent"]
+        .as_str()
+        .or_else(|| object["id"].as_str())
+        .ok_or_else(|| Error::Config("paid sponsored invoice has no payment reference".into()))?;
+    let period_end = invoice_period_end(object)
+        .ok_or_else(|| Error::Config("paid sponsored invoice has no period end".into()))?;
+    let customer_id = object["customer"].as_str().map(str::to_string);
+    sqlx::query(
+        "INSERT INTO billing_sponsored_subscriptions \
+         (organization_id, provider_customer_id, provider_subscription_id, status, updated_at) \
+         VALUES ($1, $2, $3, 'active', now()) \
+         ON CONFLICT (organization_id) DO UPDATE SET provider_customer_id = COALESCE(EXCLUDED.provider_customer_id, billing_sponsored_subscriptions.provider_customer_id), \
+           provider_subscription_id = EXCLUDED.provider_subscription_id, status = 'active', updated_at = now()",
+    )
+    .bind(&organization_id)
+    .bind(customer_id.as_deref())
+    .bind(subscription_id)
+    .execute(&mut **tx)
+    .await?;
+    let line_items = sponsored_invoice_items(object);
+    for (item_id, price_id, quantity) in &line_items {
+        if let Some(offer) = BillingOffer::ALL
+            .into_iter()
+            .find(|offer| catalogue.id_for(*offer) == price_id)
+        {
+            sponsored_billing::record_provider_item(
+                tx,
+                &organization_id,
+                item_id,
+                price_id,
+                offer,
+                *quantity,
+            )
+            .await
+            .map_err(Error::from)?;
+        }
+    }
+    let operations: Vec<(String, String)> = sqlx::query_as(
+        "SELECT operation_id, offer FROM billing_sponsored_operations \
+         WHERE organization_id = $1 AND state IN ('checkout_created', 'provider_pending') \
+           AND effective_from < $2 \
+         ORDER BY created_at FOR UPDATE",
+    )
+    .bind(&organization_id)
+    .bind(period_end)
+    .fetch_all(&mut **tx)
+    .await?;
+    for (operation_id, offer) in operations {
+        let offer = billing_offer(&offer)?;
+        let provider_item_id = line_items
+            .iter()
+            .find(|(_, price_id, _)| price_id == catalogue.id_for(offer))
+            .map(|(item_id, _, _)| item_id.clone());
+        if provider_item_id.is_none() {
+            continue;
+        }
+        let evidence = sponsored_billing::SponsoredProviderEvidence {
+            customer_id: customer_id.clone(),
+            subscription_id: subscription_id.to_string(),
+            schedule_id: None,
+            checkout_session_id: None,
+            payment_reference: payment_reference.to_string(),
+            provider_item_id,
+        };
+        sponsored_billing::complete_paid_checkout(tx, &operation_id, &evidence)
+            .await
+            .map_err(Error::from)?;
+    }
+    Ok(true)
+}
+
+fn sponsored_invoice_items(object: &serde_json::Value) -> Vec<(String, String, i64)> {
+    object["lines"]["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|line| {
+            let item_id = line["subscription_item"].as_str().or_else(|| {
+                line["parent"]["subscription_item_details"]["subscription_item"].as_str()
+            })?;
+            let price_id = line["price"]["id"]
+                .as_str()
+                .or_else(|| line["pricing"]["price_details"]["price"].as_str())
+                .or_else(|| line["parent"]["subscription_item_details"]["price"].as_str())?;
+            let quantity = line["quantity"].as_i64().unwrap_or(1);
+            Some((item_id.to_string(), price_id.to_string(), quantity))
+        })
+        .collect()
+}
+
 /// The subscription ended for good: back to the free tier (existing data stays readable - the
 /// entitlement gates are creation-time only).
 async fn subscription_deleted(
@@ -2173,6 +3378,38 @@ async fn subscription_deleted(
         .bind(subscription_id)
         .execute(&mut **tx)
         .await?;
+        return Ok(());
+    }
+    if let Some(organization_id) = sponsored_subscription_organization(tx, object).await? {
+        let subscription_id = object["id"].as_str().ok_or_else(|| {
+            Error::Config("sponsored subscription event has no subscription id".into())
+        })?;
+        apply_sponsored_subscription_state(
+            tx,
+            &organization_id,
+            subscription_id,
+            "canceled",
+            true,
+            object["customer"].as_str(),
+            None,
+            subscription_period_start(object),
+            subscription_period_end(object),
+        )
+        .await?;
+        audit::record_tx(
+            &mut *tx,
+            &organization_id,
+            "stripe",
+            "billing.sponsored_cancelled",
+            audit::Context {
+                detail: Some("sponsored subscription ended"),
+                ..Default::default()
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+    if object["metadata"]["organization_id"].as_str().is_some() {
         return Ok(());
     }
     let Some(org_id) = org_for_subscription(tx, object).await? else {
@@ -2210,7 +3447,35 @@ async fn reconcile_subscription(
     observation: SubscriptionObservation,
     subscription_id: &str,
     org_hint: Option<&str>,
+    sponsored_hint: bool,
 ) -> Result<()> {
+    if sponsored_hint {
+        let Some(organization_id) = org_hint else {
+            return Ok(());
+        };
+        let (status, terminal) = match observation {
+            SubscriptionObservation::Current(snapshot) => {
+                let Some(mapped) = sponsored_subscription_status(snapshot.status) else {
+                    return Ok(());
+                };
+                mapped
+            }
+            SubscriptionObservation::Missing => ("canceled", true),
+        };
+        apply_sponsored_subscription_state(
+            tx,
+            organization_id,
+            subscription_id,
+            status,
+            terminal,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+        return Ok(());
+    }
     let org_id = match org_hint {
         Some(org_id) => Some(org_id.to_string()),
         None => {
@@ -2543,6 +3808,26 @@ mod tests {
     }
 
     #[test]
+    fn sponsored_subscription_terminal_states_clear_the_provider_link() {
+        assert_eq!(
+            sponsored_subscription_status(SubscriptionStatus::Active),
+            Some(("active", false))
+        );
+        assert_eq!(
+            sponsored_subscription_status(SubscriptionStatus::PastDue),
+            Some(("past_due", false))
+        );
+        assert_eq!(
+            sponsored_subscription_status(SubscriptionStatus::Unpaid),
+            Some(("canceled", true))
+        );
+        assert_eq!(
+            sponsored_subscription_status(SubscriptionStatus::Canceled),
+            Some(("canceled", true))
+        );
+    }
+
+    #[test]
     fn provider_errors_keep_status_and_code_for_retry_policy() {
         let cases = [
             (401, None, ProviderErrorKind::Authentication),
@@ -2685,5 +3970,42 @@ mod tests {
         });
         assert_eq!(invoice_period_end(&invoice), Some(1_950_000_000));
         assert_eq!(invoice_subscription_id(&invoice), Some("sub-1"));
+    }
+
+    #[test]
+    fn sponsored_snapshot_and_invoice_items_use_pinned_nested_fields() {
+        let subscription = serde_json::json!({
+            "id": "sub-sponsored",
+            "customer": "cus-sponsored",
+            "status": "active",
+            "current_period_start": 1,
+            "current_period_end": 2,
+            "schedule": "sub_sched",
+            "items": {"data": [{
+                "id": "si-sponsored",
+                "price": {"id": "price-sponsored"},
+                "quantity": 3,
+                "current_period_start": 1_700_000_000,
+                "current_period_end": 1_702_678_400
+            }]}
+        });
+        let snapshot = sponsored_subscription_snapshot(&subscription, "sub-sponsored").unwrap();
+        assert_eq!(snapshot.current_period_start, Some(1_700_000_000));
+        assert_eq!(snapshot.current_period_end, Some(1_702_678_400));
+        assert_eq!(snapshot.schedule_id.as_deref(), Some("sub_sched"));
+
+        let invoice = serde_json::json!({
+            "lines": {"data": [{
+                "parent": {"subscription_item_details": {
+                    "subscription_item": "si-sponsored"
+                }},
+                "pricing": {"price_details": {"price": "price-sponsored"}},
+                "quantity": 3
+            }]}
+        });
+        assert_eq!(
+            sponsored_invoice_items(&invoice),
+            vec![("si-sponsored".into(), "price-sponsored".into(), 3)]
+        );
     }
 }

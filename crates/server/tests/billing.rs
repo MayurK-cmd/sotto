@@ -949,6 +949,174 @@ async fn subscription_deleted_downgrades_via_stored_id() {
 }
 
 #[tokio::test]
+async fn sponsored_subscription_deleted_cancels_named_seats_without_downgrading_org() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let org_id = "billing-org-sponsored-deleted";
+    let owner_id = "billing-user-sponsored-owner";
+    let beneficiary_id = "billing-user-sponsored-beneficiary";
+    let operation_id = "sponsored:billing-deleted-operation";
+    for table in [
+        "billing_sponsored_seats",
+        "billing_sponsored_operations",
+        "billing_sponsored_subscription_items",
+        "billing_sponsored_subscriptions",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE organization_id = $1"))
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("clean sponsored lifecycle fixture");
+    }
+    seed_user(&pool, owner_id).await;
+    seed_user(&pool, beneficiary_id).await;
+    seed_org(&pool, org_id, "team", owner_id, "owner").await;
+    sqlx::query(
+        "INSERT INTO billing_sponsored_subscriptions \
+         (organization_id, provider_customer_id, provider_subscription_id, status) \
+         VALUES ($1, 'cus_sponsored_deleted', 'sub_sponsored_deleted', 'active')",
+    )
+    .bind(org_id)
+    .execute(&pool)
+    .await
+    .expect("seed sponsored subscription");
+    sqlx::query(
+        "INSERT INTO billing_sponsored_operations \
+         (operation_id, organization_id, actor_user_id, idempotency_key, request_hash, action, \
+          beneficiary_id, offer, quote_version, quote_expires_at_epoch, effective_from, \
+          provider_idempotency_key, state, result_code) \
+         VALUES ($1, $2, $3, 'deleted-idempotency', 'deleted-hash', 'add', $4, \
+                 'standard_monthly', 1, 2000000000, 1700000000, 'deleted-provider-key', 'active', 'ok')",
+    )
+    .bind(operation_id)
+    .bind(org_id)
+    .bind(owner_id)
+    .bind(beneficiary_id)
+    .execute(&pool)
+    .await
+    .expect("seed sponsored operation");
+    sqlx::query(
+        "INSERT INTO billing_sponsored_seats \
+         (seat_id, organization_id, beneficiary_id, offer, effective_from, state, operation_id) \
+         VALUES ('seat:billing-deleted', $1, $2, 'standard_monthly', 1700000000, 'active', $3)",
+    )
+    .bind(org_id)
+    .bind(beneficiary_id)
+    .bind(operation_id)
+    .execute(&pool)
+    .await
+    .expect("seed sponsored seat");
+
+    let app = app_with_provider(
+        pool.clone(),
+        Arc::new(TestProvider {
+            observation: SubscriptionObservation::Missing,
+            personal_period_end: None,
+        }),
+    );
+    let payload = serde_json::json!({
+        "id": "evt_sponsored_deleted",
+        "created": 1_800_000_000,
+        "api_version": STRIPE_API_VERSION,
+        "type": "customer.subscription.deleted",
+        "data": { "object": {
+            "id": "sub_sponsored_deleted",
+            "customer": "cus_sponsored_deleted",
+            "metadata": {"organization_id": org_id}
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &payload, Some(&stripe_signature(&payload))).await,
+        StatusCode::OK
+    );
+    let stored: (String, Option<String>) = sqlx::query_as(
+        "SELECT status, provider_subscription_id FROM billing_sponsored_subscriptions \
+         WHERE organization_id = $1",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("sponsored lifecycle state");
+    assert_eq!(stored, ("canceled".into(), None));
+    let seat_state: String =
+        sqlx::query_scalar("SELECT state FROM billing_sponsored_seats WHERE organization_id = $1")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("canceled sponsored seat");
+    assert_eq!(seat_state, "canceled");
+    assert_eq!(org_billing_state(&pool, org_id).await.0, "team");
+}
+
+#[tokio::test]
+async fn unmatched_sponsored_lifecycle_events_never_change_legacy_billing() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let free_org = "billing-org-sponsored-early-free";
+    let team_org = "billing-org-sponsored-early-team";
+    let free_owner = "billing-user-sponsored-early-free";
+    let team_owner = "billing-user-sponsored-early-team";
+    seed_user(&pool, free_owner).await;
+    seed_user(&pool, team_owner).await;
+    seed_org(&pool, free_org, "free", free_owner, "owner").await;
+    seed_org(&pool, team_org, "team", team_owner, "owner").await;
+    sqlx::query(
+        "UPDATE organizations SET stripe_subscription_id = 'sub_legacy_early' WHERE id = $1",
+    )
+    .bind(team_org)
+    .execute(&pool)
+    .await
+    .expect("seed legacy subscription link");
+    let app = app_with_provider(
+        pool.clone(),
+        Arc::new(TestProvider {
+            observation: SubscriptionObservation::Missing,
+            personal_period_end: None,
+        }),
+    );
+    let updated = serde_json::json!({
+        "id": "evt_sponsored_early_updated",
+        "created": 1_800_000_000,
+        "api_version": STRIPE_API_VERSION,
+        "type": "customer.subscription.updated",
+        "data": { "object": {
+            "id": "sub_sponsored_early",
+            "status": "active",
+            "cancel_at_period_end": false,
+            "metadata": {"organization_id": free_org}
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &updated, Some(&stripe_signature(&updated))).await,
+        StatusCode::OK
+    );
+    assert_eq!(org_billing_state(&pool, free_org).await.0, "free");
+
+    let deleted = serde_json::json!({
+        "id": "evt_sponsored_early_deleted",
+        "created": 1_800_000_001,
+        "api_version": STRIPE_API_VERSION,
+        "type": "customer.subscription.deleted",
+        "data": { "object": {
+            "id": "sub_sponsored_early_deleted",
+            "metadata": {"organization_id": team_org}
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &deleted, Some(&stripe_signature(&deleted))).await,
+        StatusCode::OK
+    );
+    let team_state = org_billing_state(&pool, team_org).await;
+    assert_eq!(team_state.0, "team");
+    assert_eq!(team_state.2.as_deref(), Some("sub_legacy_early"));
+}
+
+#[tokio::test]
 async fn webhooks_cannot_change_deleting_or_deleted_organisations() {
     let Some(pool) = pool_or_skip().await else {
         return;
